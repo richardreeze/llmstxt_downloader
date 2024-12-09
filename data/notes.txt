@@ -1,0 +1,252 @@
+Objective is to make this page work like my previous script.
+
+Part 1:
+```
+import re
+import requests
+from bs4 import BeautifulSoup
+from collections import deque
+from html.parser import HTMLParser
+from urllib.parse import urlparse, urljoin, urldefrag
+
+# Mongodb: https://www.mongodb.com/docs/drivers/node/current
+
+# Regex pattern to match a URL
+HTTP_URL_PATTERN = r'^http[s]*://.+'
+
+
+# Create a class to parse the HTML and get the hyperlinks
+class HyperlinkParser(HTMLParser):
+
+    def __init__(self):
+        super().__init__()
+        self.hyperlinks = []
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if tag == "a" and "href" in attrs:
+            self.hyperlinks.append(attrs["href"])
+
+
+def get_hyperlinks(url):
+    try:
+        response = requests.get(url)
+        final_url = response.url
+        if not response.headers['Content-Type'].startswith("text/html"):
+            return [], final_url
+        html = response.text
+    except Exception as e:
+        print(f"Error fetching {url}:", e)
+        return [], url
+    parser = HyperlinkParser()
+    parser.feed(html)
+    return parser.hyperlinks, final_url
+
+
+def get_domain_hyperlinks(local_domain, base_url, url):
+    clean_links = []
+    hyperlinks, final_url = get_hyperlinks(url)
+    
+    for link in set(hyperlinks):
+        clean_link = None
+        if re.search(HTTP_URL_PATTERN, link):
+            url_obj = urlparse(link)
+            if url_obj.netloc == local_domain:
+                clean_link = urldefrag(link)[0]
+        else:
+            if link.startswith('./') or link.startswith('/') or not link.startswith(('#', 'mailto:')):
+                link = urljoin(final_url, link)
+                url_obj = urlparse(link)
+                if url_obj.netloc == local_domain:
+                    clean_link = urldefrag(link)[0]
+            elif link.startswith("#") or link.startswith("mailto:"):
+                continue
+                
+        if clean_link is not None:
+            # Filter out markdown source files and normalize URLs
+            if not (clean_link.endswith('.md') or clean_link.endswith('.html.md')):
+                # Remove cdn-cgi links (these are Cloudflare internal URLs)
+                if 'cdn-cgi' not in clean_link:
+                    clean_links.append(clean_link)
+            
+    return list(set(clean_links))
+
+
+def grab_urls(url):
+    local_domain = urlparse(url).netloc
+    queue = deque([url])
+    seen = set([urldefrag(url)[0]])
+    all_links = [url]
+
+    while queue:
+        url = queue.popleft()
+        print(url)
+
+        # Get new links and sort them alphabetically
+        new_links = get_domain_hyperlinks(local_domain, url, url)
+        new_links.sort()  # Sort new links before adding to queue
+        
+        for link in new_links:
+            if link not in seen:
+                queue.append(link)
+                seen.add(link)
+                all_links.append(link)
+
+    # Keep homepage first, sort the rest alphabetically
+    sorted_links = [all_links[0]] + sorted(all_links[1:])
+
+    with open('pages.txt', 'w', encoding='UTF-8') as f:
+        for link in sorted_links:
+            f.write(link + '\n')
+
+
+grab_urls('https://docs.fastht.ml/')
+
+```
+
+Part 2:
+```
+import requests
+from bs4 import BeautifulSoup
+import re
+import html2text
+
+
+def find_largest_text_block(soup):
+    text_blocks = []
+    for element in soup.find_all(['div', 'section', 'article']):
+        # Skip elements that are likely navigation or footer
+        if any(cls in str(element.get('class', [])).lower() 
+               for cls in ['nav', 'footer', 'header', 'sidebar', 'menu']):
+            continue
+        text_length = len(element.get_text(strip=True))
+        text_blocks.append((text_length, element))
+    if text_blocks:
+        return max(text_blocks, key=lambda x: x[0])[1]
+    return None
+
+
+def clean_element(element):
+    # Remove unwanted elements
+    for unwanted in element.find_all(['script', 'style', 'nav', 'header', 
+                                    'footer', 'aside']):
+        unwanted.decompose()
+
+    # Remove elements with unwanted classes
+    unwanted_classes = [
+        'nav', 'navigation', 'menu', 'header', 'footer', 'sidebar',
+        'ad', 'advertisement', 'social', 'comments', 'related', 'share',
+        'meta', 'tags', 'toolbar', 'popup', 'cookie'
+    ]
+    for class_name in unwanted_classes:
+        for unwanted in element.find_all(class_=re.compile(class_name, re.I)):
+            unwanted.decompose()
+
+    return element
+
+
+def scrape_data():
+    try:
+        with open('pages.txt', 'r', encoding='UTF-8') as f:
+            urls = f.read().splitlines()
+    except Exception as e:
+        print(f"Failed to read pages.txt: {e}")
+        return
+
+    total_urls = len(urls)
+    all_content = []
+
+    # Configure HTML to Markdown converter
+    h = html2text.HTML2Text()
+    h.ignore_links = False
+    h.ignore_images = False
+    h.ignore_tables = False
+    h.body_width = 0
+
+    for index, url in enumerate(urls):
+        try:
+            print(f"Processing {index + 1}/{total_urls}: {url}")
+            response = requests.get(url, allow_redirects=True, 
+                                 headers={'User-Agent': 'Mozilla/5.0'})
+            response.raise_for_status()  # Raise exception for bad status codes
+            soup = BeautifulSoup(response.text, "html.parser")
+
+            # Try to find main content using various selectors
+            main_content = None
+            content_elements = [
+                'main', 'article', '[role="main"]', '.main-content', '#main-content',
+                '.post-content', '.article-content', '.content', '#content',
+                '.entry-content', '.post', '.blog-post', '.entry',
+                'div[itemprop="articleBody"]', '.story-content', '.page-content',
+                '.article-body', '.post-body', '.entry-body', '.content-body'
+            ]
+
+            for selector in content_elements:
+                if selector.startswith('.'):
+                    element = soup.find(class_=selector[1:])
+                elif selector.startswith('#'):
+                    element = soup.find(id=selector[1:])
+                elif selector.startswith('['):
+                    attr, value = selector[1:-1].split('=')
+                    value = value.strip('"')
+                    element = soup.find(attrs={attr: value})
+                else:
+                    element = soup.find(selector)
+
+                if element:
+                    main_content = element
+                    break
+
+            # If no main content found, try finding largest text block
+            if not main_content:
+                main_content = find_largest_text_block(soup)
+
+            # If still no main content, fall back to body
+            if not main_content:
+                main_content = soup.body
+
+            if main_content:
+                # Clean up the content
+                main_content = clean_element(main_content)
+
+                # Convert HTML to Markdown
+                markdown_content = h.handle(str(main_content))
+
+                # Clean up the markdown
+                # Remove multiple blank lines
+                markdown_content = re.sub(r'\n\s*\n', '\n\n', markdown_content)
+                # Remove trailing whitespace
+                markdown_content = '\n'.join(
+                    line.rstrip() for line in markdown_content.splitlines())
+                # Remove lines that are just symbols
+                markdown_content = '\n'.join(
+                    line for line in markdown_content.splitlines() 
+                    if not re.match(r'^[\s\-_=*#]+$', line))
+                # Remove empty links
+                markdown_content = re.sub(r'\[\]\(.*?\)', '', markdown_content)
+                # Remove duplicate spaces
+                markdown_content = re.sub(r' +', ' ', markdown_content)
+
+                all_content.append(
+                    f"<!-- Source: {url} -->\n\n{markdown_content}\n\n---")
+            else:
+                print(f"Could not find any content for {url}")
+                continue
+
+        except Exception as e:
+            print(f"Failed to crawl {url}: {e}")
+            continue
+
+        print(f"Scraped {index + 1}/{total_urls} pages")
+
+    try:
+        with open('docs.txt', 'w', encoding='UTF-8') as f:
+            f.write('\n\n'.join(all_content))
+        print("All pages are scraped!")
+    except Exception as e:
+        print(f"Failed to write to docs.txt: {e}")
+
+
+if __name__ == "__main__":
+    scrape_data()
+```
